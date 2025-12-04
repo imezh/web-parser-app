@@ -169,24 +169,75 @@ class WebParser:
             default_dir = os.path.join(user_data_dir, "Default")
             os.makedirs(default_dir, exist_ok=True)
 
-            # Preferences для автоматического выбора сертификата
+            # Получаем информацию о сертификате для фильтра
+            cert_info = None
+            if certs:
+                try:
+                    # Получаем Issuer сертификата для фильтра
+                    powershell_cmd = f"""
+                    Get-ChildItem -Path Cert:\\CurrentUser\\My |
+                    Where-Object {{ $_.Thumbprint -eq '{certs[0]}' }} |
+                    Select-Object -ExpandProperty Issuer
+                    """
+                    result = subprocess.run(
+                        ["powershell", "-Command", powershell_cmd],
+                        capture_output=True,
+                        text=True,
+                        encoding='utf-8',
+                        timeout=10
+                    )
+                    if result.returncode == 0 and result.stdout.strip():
+                        issuer = result.stdout.strip()
+                        logger.debug(f"Issuer сертификата: {issuer}")
+                        # Извлекаем CN из issuer
+                        if "CN=" in issuer:
+                            cn_start = issuer.find("CN=") + 3
+                            cn_end = issuer.find(",", cn_start)
+                            if cn_end == -1:
+                                cn_end = len(issuer)
+                            cn = issuer[cn_start:cn_end].strip()
+                            cert_info = {"CN": cn}
+                            logger.info(f"Будет использован фильтр сертификата: CN={cn}")
+                except Exception as e:
+                    logger.warning(f"Не удалось получить Issuer сертификата: {e}")
+
+            # Local State для политики AutoSelectCertificateForUrls
+            local_state = {
+                "browser": {
+                    "enabled_labs_experiments": []
+                }
+            }
+
+            # Добавляем политику AutoSelectCertificateForUrls если есть информация о сертификате
+            if cert_info:
+                # Формируем правильный JSON для политики
+                policy_value = json.dumps({
+                    "pattern": "*",
+                    "filter": {
+                        "ISSUER": cert_info
+                    }
+                })
+                local_state["policy"] = {
+                    "AutoSelectCertificateForUrls": [policy_value]
+                }
+                logger.debug(f"Политика AutoSelectCertificateForUrls: {policy_value}")
+
+            # Сохраняем Local State
+            local_state_path = os.path.join(user_data_dir, "Local State")
+            with open(local_state_path, 'w', encoding='utf-8') as f:
+                json.dump(local_state, f, indent=2)
+            logger.debug(f"Local State сохранен: {local_state_path}")
+
+            # Preferences для content settings
             preferences = {
                 "profile": {
                     "content_settings": {
                         "exceptions": {
                             "auto_select_certificate": {
-                                "*": {
+                                "*,*": {
                                     "setting": 1
                                 }
                             }
-                        }
-                    }
-                },
-                "security": {
-                    "auto_select_certificate_for_urls": {
-                        "*": {
-                            "pattern": "*",
-                            "filter": {}
                         }
                     }
                 }
@@ -198,20 +249,59 @@ class WebParser:
                 json.dump(preferences, f, indent=2)
             logger.debug(f"Chrome preferences сохранены: {prefs_path}")
 
+            # Создаем managed policies файл
+            if cert_info:
+                try:
+                    # Создаем директорию для политик
+                    managed_dir = os.path.join(user_data_dir, "Default", "managed_policies")
+                    os.makedirs(managed_dir, exist_ok=True)
+
+                    # Формируем политику
+                    managed_policies = {
+                        "AutoSelectCertificateForUrls": [
+                            json.dumps({
+                                "pattern": "*",
+                                "filter": {
+                                    "ISSUER": cert_info
+                                }
+                            })
+                        ]
+                    }
+
+                    # Сохраняем managed policies
+                    managed_path = os.path.join(managed_dir, "policies.json")
+                    with open(managed_path, 'w', encoding='utf-8') as f:
+                        json.dump(managed_policies, f, indent=2)
+                    logger.debug(f"Managed policies сохранены: {managed_path}")
+                except Exception as e:
+                    logger.warning(f"Не удалось создать managed policies: {e}")
+
             # Запускаем Chromium с persistent context
             browser_args = [
                 '--ignore-certificate-errors',
                 '--disable-web-security',
                 # Автоматический выбор сертификатов
                 '--auto-select-client-certificate',
-                '--enable-features=AutoSelectClientCertificateForUrls',
+                '--enable-features=AutoSelectCertificateForUrls',
                 # Отключаем интерактивные диалоги
                 '--no-first-run',
                 '--no-default-browser-check',
                 # Дополнительные флаги для надежности
                 '--disable-popup-blocking',
                 '--disable-extensions',
+                # Отключаем проверки безопасности для автовыбора сертификата
+                '--allow-running-insecure-content',
             ]
+
+            # Добавляем policy для автовыбора сертификата если есть информация
+            if cert_info:
+                policy_json = json.dumps({
+                    "pattern": "*",
+                    "filter": {"ISSUER": cert_info}
+                })
+                browser_args.append(f'--auto-select-client-certificate-for-urls={policy_json}')
+                logger.debug(f"Добавлен аргумент auto-select-client-certificate-for-urls: {policy_json}")
+
             logger.debug(f"Аргументы браузера: {browser_args}")
 
             # Создаем persistent context
