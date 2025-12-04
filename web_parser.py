@@ -10,6 +10,7 @@ import json
 import argparse
 import time
 import logging
+import threading
 from pathlib import Path
 from typing import Dict, Any, Optional
 from logging.handlers import RotatingFileHandler
@@ -76,6 +77,79 @@ def setup_logging(log_level: str = 'INFO', log_file: Optional[str] = None):
     logger.debug(f"Логирование настроено: уровень={log_level}")
 
 
+def auto_close_certificate_dialog(stop_event: threading.Event):
+    """
+    Автоматически закрывает диалог выбора сертификата Windows
+
+    Запускается в фоновом потоке и следит за появлением диалога
+    "Select a certificate". При обнаружении автоматически выбирает
+    первый сертификат и нажимает OK.
+
+    Args:
+        stop_event: Event для остановки потока
+    """
+    try:
+        from pywinauto import Desktop
+        from pywinauto.findwindows import ElementNotFoundError
+
+        logger.debug("Запущен поток автоматического закрытия диалога сертификата")
+
+        while not stop_event.is_set():
+            try:
+                # Ищем окно с заголовком содержащим "certificate" или "сертификат"
+                desktop = Desktop(backend="uia")
+
+                # Попытка найти диалог выбора сертификата
+                windows = desktop.windows()
+                for window in windows:
+                    try:
+                        title = window.window_text().lower()
+                        # Ищем окна с ключевыми словами
+                        if any(keyword in title for keyword in ['certificate', 'сертификат', 'select a certificate']):
+                            logger.info(f"Обнаружен диалог сертификата: '{window.window_text()}'")
+
+                            # Пытаемся найти и нажать кнопку OK
+                            try:
+                                # Ищем кнопку OK, ОК или similar
+                                ok_button = None
+                                for btn_text in ['OK', 'ОК', 'Ok', 'Ок']:
+                                    try:
+                                        ok_button = window.child_window(title=btn_text, control_type="Button")
+                                        if ok_button.exists():
+                                            break
+                                    except:
+                                        continue
+
+                                if ok_button and ok_button.exists():
+                                    logger.info("Нажатие кнопки OK в диалоге сертификата")
+                                    ok_button.click()
+                                    logger.info("✓ Диалог сертификата закрыт автоматически")
+                                    time.sleep(0.5)  # Даем время на закрытие
+                                else:
+                                    # Пытаемся нажать Enter как альтернативу
+                                    logger.debug("Кнопка OK не найдена, пытаемся нажать Enter")
+                                    window.type_keys('{ENTER}')
+                                    logger.info("✓ Отправлен Enter в диалог сертификата")
+                            except Exception as e:
+                                logger.warning(f"Не удалось нажать OK: {e}")
+                    except:
+                        continue
+
+            except ElementNotFoundError:
+                pass
+            except Exception as e:
+                logger.debug(f"Ошибка при поиске диалога: {e}")
+
+            # Проверяем каждые 0.5 секунды
+            stop_event.wait(0.5)
+
+        logger.debug("Поток автоматического закрытия диалога остановлен")
+    except ImportError:
+        logger.warning("pywinauto не установлен, автоматическое закрытие диалога недоступно")
+    except Exception as e:
+        logger.error(f"Ошибка в потоке автоматического закрытия диалога: {e}", exc_info=True)
+
+
 class WebParser:
     """Класс для парсинга веб-страниц"""
 
@@ -94,6 +168,8 @@ class WebParser:
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
         self._user_data_dir: Optional[str] = None
+        self._dialog_thread: Optional[threading.Thread] = None
+        self._dialog_stop_event: Optional[threading.Event] = None
         logger.debug("WebParser инициализирован успешно")
 
     def get_windows_certificates(self) -> list:
@@ -331,6 +407,17 @@ class WebParser:
             self.page.set_default_navigation_timeout(self.timeout)
             logger.debug(f"Таймауты установлены: {self.timeout}ms")
 
+            # Запускаем поток автоматического закрытия диалога сертификата
+            self._dialog_stop_event = threading.Event()
+            self._dialog_thread = threading.Thread(
+                target=auto_close_certificate_dialog,
+                args=(self._dialog_stop_event,),
+                daemon=True,
+                name="CertificateDialogHandler"
+            )
+            self._dialog_thread.start()
+            logger.info("Запущен поток автоматического закрытия диалога сертификата")
+
             # Сохраняем путь к user data для очистки
             self._user_data_dir = user_data_dir
 
@@ -495,6 +582,17 @@ class WebParser:
     def close(self):
         """Закрытие браузера и освобождение ресурсов"""
         logger.info("Закрытие браузера и освобождение ресурсов")
+
+        # Останавливаем поток автоматического закрытия диалога
+        try:
+            if self._dialog_stop_event:
+                logger.debug("Остановка потока автоматического закрытия диалога")
+                self._dialog_stop_event.set()
+                if self._dialog_thread and self._dialog_thread.is_alive():
+                    self._dialog_thread.join(timeout=2)
+                logger.debug("Поток остановлен")
+        except Exception as e:
+            logger.warning(f"Ошибка при остановке потока диалога: {e}")
 
         try:
             if self.page:
