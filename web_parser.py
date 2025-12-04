@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
-from playwright.sync_api import sync_playwright, Page, Browser, BrowserContext
+from playwright.sync_api import sync_playwright, Page, BrowserContext
 import subprocess
 
 # Настройка логгера
@@ -91,9 +91,9 @@ class WebParser:
         self.headless = headless
         self.timeout = timeout
         self.playwright = None
-        self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
+        self._user_data_dir: Optional[str] = None
         logger.debug("WebParser инициализирован успешно")
 
     def get_windows_certificates(self) -> list:
@@ -135,109 +135,114 @@ class WebParser:
             logger.error(f"Ошибка при получении сертификатов: {e}", exc_info=True)
             return []
 
-    def _setup_auto_certificate_selection(self):
-        """
-        Настраивает автоматический выбор клиентского сертификата через CDP
-
-        Использует Chrome DevTools Protocol для автоматического выбора
-        первого доступного сертификата при появлении диалога выбора
-        """
-        logger.debug("Настройка автоматического выбора сертификатов через CDP")
-        try:
-            # Получаем CDP сессию
-            cdp_session = self.page.context.new_cdp_session(self.page)
-
-            # Включаем Security домен для обработки событий сертификатов
-            cdp_session.send('Security.enable')
-            logger.debug("Security домен CDP включен")
-
-            # Устанавливаем обработчик для автоматического выбора сертификата
-            def handle_certificate_selection(event):
-                """Обработчик события выбора сертификата"""
-                try:
-                    logger.debug(f"Получено событие выбора сертификата: {event}")
-                    # Автоматически выбираем первый сертификат (индекс 0)
-                    cdp_session.send('Security.handleCertificateError', {
-                        'eventId': event.get('eventId', 0),
-                        'action': 'continue'
-                    })
-                    logger.info("Сертификат выбран автоматически")
-                except Exception as e:
-                    logger.warning(f"Ошибка при автоматическом выборе сертификата: {e}")
-
-            # Подписываемся на события сертификатов
-            cdp_session.on('Security.certificateError', handle_certificate_selection)
-            logger.debug("Обработчик событий сертификатов установлен")
-
-            # Отключаем блокировку на ошибках сертификатов
-            cdp_session.send('Security.setOverrideCertificateErrors', {'override': True})
-            logger.debug("Переопределение ошибок сертификатов включено")
-
-        except Exception as e:
-            # Не критичная ошибка - продолжаем работу
-            logger.warning(f"Не удалось настроить автоматический выбор сертификатов через CDP: {e}")
-            logger.debug("Будет использован только флаг --auto-select-client-certificate")
-
     def setup_browser(self, ignore_https_errors: bool = False):
         """
-        Настройка и запуск браузера
+        Настройка и запуск браузера с автоматическим выбором сертификатов
 
         Args:
             ignore_https_errors: Игнорировать ошибки SSL
         """
-        logger.info("Запуск браузера Chromium")
+        logger.info("Запуск браузера Chromium с автоматическим выбором сертификатов")
         logger.debug(f"Параметры: headless={self.headless}, ignore_https_errors={ignore_https_errors}")
 
         try:
             logger.debug("Инициализация Playwright")
             self.playwright = sync_playwright().start()
 
-            # Запускаем Chromium с поддержкой автоматического выбора клиентских сертификатов
             # Получаем сертификаты для логирования
             certs = self.get_windows_certificates()
             if certs:
-                logger.info(f"Будет использован сертификат: {certs[0]}")
+                logger.info(f"Найден сертификат: {certs[0]}")
+            else:
+                logger.warning("Сертификаты не найдены, автоматический выбор может не работать")
 
+            # Создаем временную директорию для user data
+            import tempfile
+            user_data_dir = tempfile.mkdtemp(prefix="chrome_profile_")
+            logger.debug(f"Создана временная директория профиля: {user_data_dir}")
+
+            # Настраиваем Chrome preferences для автоматического выбора сертификатов
+            import json
+            import os
+
+            # Создаем структуру директорий
+            default_dir = os.path.join(user_data_dir, "Default")
+            os.makedirs(default_dir, exist_ok=True)
+
+            # Preferences для автоматического выбора сертификата
+            preferences = {
+                "profile": {
+                    "content_settings": {
+                        "exceptions": {
+                            "auto_select_certificate": {
+                                "*": {
+                                    "setting": 1
+                                }
+                            }
+                        }
+                    }
+                },
+                "security": {
+                    "auto_select_certificate_for_urls": {
+                        "*": {
+                            "pattern": "*",
+                            "filter": {}
+                        }
+                    }
+                }
+            }
+
+            # Сохраняем preferences
+            prefs_path = os.path.join(default_dir, "Preferences")
+            with open(prefs_path, 'w', encoding='utf-8') as f:
+                json.dump(preferences, f, indent=2)
+            logger.debug(f"Chrome preferences сохранены: {prefs_path}")
+
+            # Запускаем Chromium с persistent context
             browser_args = [
                 '--ignore-certificate-errors',
                 '--disable-web-security',
-                # Основные флаги для автоматического выбора сертификатов
+                # Автоматический выбор сертификатов
                 '--auto-select-client-certificate',
                 '--enable-features=AutoSelectClientCertificateForUrls',
                 # Отключаем интерактивные диалоги
                 '--no-first-run',
                 '--no-default-browser-check',
+                # Дополнительные флаги для надежности
+                '--disable-popup-blocking',
+                '--disable-extensions',
             ]
             logger.debug(f"Аргументы браузера: {browser_args}")
 
-            self.browser = self.playwright.chromium.launch(
-                headless=self.headless,
-                args=browser_args
-            )
-            logger.info("Браузер Chromium запущен успешно")
-
-            # Создаем контекст с настройками
+            # Создаем persistent context
             user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            logger.debug(f"User-Agent: {user_agent}")
 
-            self.context = self.browser.new_context(
+            self.context = self.playwright.chromium.launch_persistent_context(
+                user_data_dir,
+                headless=self.headless,
+                args=browser_args,
                 ignore_https_errors=ignore_https_errors,
                 accept_downloads=True,
                 java_script_enabled=True,
-                user_agent=user_agent
+                user_agent=user_agent,
+                viewport={'width': 1280, 'height': 720}
             )
-            logger.debug("Контекст браузера создан")
+            logger.info("Браузер Chromium с persistent context запущен успешно")
 
-            self.page = self.context.new_page()
-            logger.debug("Новая страница создана")
+            # Получаем первую страницу (persistent context создает ее автоматически)
+            if len(self.context.pages) > 0:
+                self.page = self.context.pages[0]
+            else:
+                self.page = self.context.new_page()
+            logger.debug("Страница получена")
 
-            # Настраиваем автоматический выбор сертификата через CDP
-            self._setup_auto_certificate_selection()
-
-            # Устанавливаем таймаут
+            # Устанавливаем таймауты
             self.page.set_default_timeout(self.timeout)
             self.page.set_default_navigation_timeout(self.timeout)
             logger.debug(f"Таймауты установлены: {self.timeout}ms")
+
+            # Сохраняем путь к user data для очистки
+            self._user_data_dir = user_data_dir
 
         except Exception as e:
             logger.error(f"Ошибка при настройке браузера: {e}", exc_info=True)
@@ -420,15 +425,6 @@ class WebParser:
             print(f"Предупреждение: Ошибка при закрытии контекста: {e}", file=sys.stderr)
 
         try:
-            if self.browser:
-                logger.debug("Закрытие браузера")
-                self.browser.close()
-                logger.debug("Браузер закрыт")
-        except Exception as e:
-            logger.warning(f"Ошибка при закрытии браузера: {e}")
-            print(f"Предупреждение: Ошибка при закрытии браузера: {e}", file=sys.stderr)
-
-        try:
             if self.playwright:
                 logger.debug("Остановка Playwright")
                 self.playwright.stop()
@@ -436,6 +432,16 @@ class WebParser:
         except Exception as e:
             logger.warning(f"Ошибка при остановке Playwright: {e}")
             print(f"Предупреждение: Ошибка при остановке Playwright: {e}", file=sys.stderr)
+
+        # Очищаем временную директорию профиля
+        try:
+            if self._user_data_dir:
+                import shutil
+                logger.debug(f"Удаление временной директории: {self._user_data_dir}")
+                shutil.rmtree(self._user_data_dir, ignore_errors=True)
+                logger.debug("Временная директория удалена")
+        except Exception as e:
+            logger.warning(f"Ошибка при удалении временной директории: {e}")
 
         logger.info("Все ресурсы освобождены")
 
