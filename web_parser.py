@@ -89,50 +89,154 @@ def auto_close_certificate_dialog(stop_event: threading.Event):
         stop_event: Event для остановки потока
     """
     try:
-        from pywinauto import Desktop
+        from pywinauto import Desktop, Application
         from pywinauto.findwindows import ElementNotFoundError
+        import pywinauto.keyboard as keyboard
 
         logger.debug("Запущен поток автоматического закрытия диалога сертификата")
 
         while not stop_event.is_set():
             try:
-                # Ищем окно с заголовком содержащим "certificate" или "сертификат"
-                desktop = Desktop(backend="uia")
-
-                # Попытка найти диалог выбора сертификата
-                windows = desktop.windows()
-                for window in windows:
+                # Пробуем оба backend'а: uia (современный) и win32 (классический)
+                for backend in ["uia", "win32"]:
                     try:
-                        title = window.window_text().lower()
-                        # Ищем окна с ключевыми словами
-                        if any(keyword in title for keyword in ['certificate', 'сертификат', 'select a certificate']):
-                            logger.info(f"Обнаружен диалог сертификата: '{window.window_text()}'")
+                        desktop = Desktop(backend=backend)
+                        windows = desktop.windows()
 
-                            # Пытаемся найти и нажать кнопку OK
+                        for window in windows:
                             try:
-                                # Ищем кнопку OK, ОК или similar
-                                ok_button = None
-                                for btn_text in ['OK', 'ОК', 'Ok', 'Ок']:
-                                    try:
-                                        ok_button = window.child_window(title=btn_text, control_type="Button")
-                                        if ok_button.exists():
-                                            break
-                                    except:
-                                        continue
+                                title = window.window_text().lower()
+                                # Ищем окна с ключевыми словами
+                                if any(keyword in title for keyword in ['certificate', 'сертификат', 'select a certificate']):
+                                    logger.info(f"Обнаружен диалог сертификата: '{window.window_text()}' (backend: {backend})")
 
-                                if ok_button and ok_button.exists():
-                                    logger.info("Нажатие кнопки OK в диалоге сертификата")
-                                    ok_button.click()
-                                    logger.info("✓ Диалог сертификата закрыт автоматически")
-                                    time.sleep(0.5)  # Даем время на закрытие
-                                else:
-                                    # Пытаемся нажать Enter как альтернативу
-                                    logger.debug("Кнопка OK не найдена, пытаемся нажать Enter")
-                                    window.type_keys('{ENTER}')
-                                    logger.info("✓ Отправлен Enter в диалог сертификата")
+                                    # Логируем структуру окна для отладки
+                                    try:
+                                        logger.debug("Структура диалога:")
+                                        window.print_control_identifiers(depth=3)
+                                    except:
+                                        pass
+
+                                    dialog_closed = False
+
+                                    # Метод 1: Поиск кнопки по title с различными вариантами
+                                    if not dialog_closed:
+                                        logger.debug("Метод 1: Поиск кнопки OK по title")
+                                        for btn_text in ['OK', 'ОК', 'Ok', 'Ок', '&OK', '&ОК']:
+                                            try:
+                                                ok_button = window.child_window(title=btn_text, control_type="Button")
+                                                if ok_button.exists(timeout=0.5):
+                                                    logger.info(f"Найдена кнопка: '{btn_text}'")
+                                                    # Пробуем разные методы нажатия
+                                                    try:
+                                                        ok_button.set_focus()
+                                                        time.sleep(0.1)
+                                                        ok_button.click_input()
+                                                        logger.info("✓ Кнопка нажата через click_input()")
+                                                        dialog_closed = True
+                                                        break
+                                                    except:
+                                                        try:
+                                                            ok_button.click()
+                                                            logger.info("✓ Кнопка нажата через click()")
+                                                            dialog_closed = True
+                                                            break
+                                                        except:
+                                                            pass
+                                            except:
+                                                continue
+
+                                    # Метод 2: Поиск всех кнопок и выбор первой
+                                    if not dialog_closed:
+                                        logger.debug("Метод 2: Поиск всех кнопок")
+                                        try:
+                                            buttons = window.children(control_type="Button")
+                                            logger.debug(f"Найдено кнопок: {len(buttons)}")
+                                            for idx, btn in enumerate(buttons):
+                                                logger.debug(f"  Кнопка {idx}: title='{btn.window_text()}'")
+                                                # Пробуем нажать первую доступную кнопку (обычно это OK)
+                                                if idx == 0:
+                                                    try:
+                                                        btn.set_focus()
+                                                        time.sleep(0.1)
+                                                        btn.click_input()
+                                                        logger.info("✓ Нажата первая кнопка через click_input()")
+                                                        dialog_closed = True
+                                                        break
+                                                    except:
+                                                        pass
+                                        except Exception as e:
+                                            logger.debug(f"Ошибка при поиске кнопок: {e}")
+
+                                    # Метод 3: Активация окна и отправка Enter
+                                    if not dialog_closed:
+                                        logger.debug("Метод 3: Активация окна + Enter")
+                                        try:
+                                            window.set_focus()
+                                            time.sleep(0.1)
+                                            keyboard.send_keys('{ENTER}')
+                                            logger.info("✓ Отправлен Enter через keyboard")
+                                            dialog_closed = True
+                                        except Exception as e:
+                                            logger.debug(f"Ошибка при отправке Enter: {e}")
+
+                                    # Метод 4: Отправка пробела (активирует кнопку по умолчанию)
+                                    if not dialog_closed:
+                                        logger.debug("Метод 4: Отправка пробела")
+                                        try:
+                                            window.set_focus()
+                                            time.sleep(0.1)
+                                            keyboard.send_keys(' ')
+                                            logger.info("✓ Отправлен пробел через keyboard")
+                                            dialog_closed = True
+                                        except Exception as e:
+                                            logger.debug(f"Ошибка при отправке пробела: {e}")
+
+                                    # Метод 5: Отправка Alt+O (горячая клавиша для OK)
+                                    if not dialog_closed:
+                                        logger.debug("Метод 5: Горячая клавиша Alt+O")
+                                        try:
+                                            window.set_focus()
+                                            time.sleep(0.1)
+                                            keyboard.send_keys('%o')  # Alt+O
+                                            logger.info("✓ Отправлена горячая клавиша Alt+O")
+                                            dialog_closed = True
+                                        except Exception as e:
+                                            logger.debug(f"Ошибка при отправке Alt+O: {e}")
+
+                                    # Метод 6: Использование Application для подключения к процессу
+                                    if not dialog_closed:
+                                        logger.debug("Метод 6: Через Application API")
+                                        try:
+                                            app = Application(backend=backend).connect(handle=window.handle)
+                                            dlg = app.window(handle=window.handle)
+                                            dlg.set_focus()
+                                            time.sleep(0.1)
+                                            # Пробуем найти кнопку через dialog
+                                            for btn_text in ['OK', 'ОК', 'Ok']:
+                                                try:
+                                                    btn = dlg[btn_text]
+                                                    btn.click()
+                                                    logger.info(f"✓ Нажата кнопка '{btn_text}' через Application API")
+                                                    dialog_closed = True
+                                                    break
+                                                except:
+                                                    continue
+                                        except Exception as e:
+                                            logger.debug(f"Ошибка в Application API: {e}")
+
+                                    if dialog_closed:
+                                        logger.info("✓ Диалог сертификата закрыт автоматически")
+                                        time.sleep(1)  # Даем время на закрытие и обработку
+                                    else:
+                                        logger.warning("⚠ Не удалось закрыть диалог ни одним методом")
+
                             except Exception as e:
-                                logger.warning(f"Не удалось нажать OK: {e}")
-                    except:
+                                logger.debug(f"Ошибка при обработке окна: {e}")
+                                continue
+
+                    except Exception as e:
+                        logger.debug(f"Ошибка с backend {backend}: {e}")
                         continue
 
             except ElementNotFoundError:
