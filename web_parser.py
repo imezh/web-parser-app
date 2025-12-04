@@ -135,6 +135,49 @@ class WebParser:
             logger.error(f"Ошибка при получении сертификатов: {e}", exc_info=True)
             return []
 
+    def _setup_auto_certificate_selection(self):
+        """
+        Настраивает автоматический выбор клиентского сертификата через CDP
+
+        Использует Chrome DevTools Protocol для автоматического выбора
+        первого доступного сертификата при появлении диалога выбора
+        """
+        logger.debug("Настройка автоматического выбора сертификатов через CDP")
+        try:
+            # Получаем CDP сессию
+            cdp_session = self.page.context.new_cdp_session(self.page)
+
+            # Включаем Security домен для обработки событий сертификатов
+            cdp_session.send('Security.enable')
+            logger.debug("Security домен CDP включен")
+
+            # Устанавливаем обработчик для автоматического выбора сертификата
+            def handle_certificate_selection(event):
+                """Обработчик события выбора сертификата"""
+                try:
+                    logger.debug(f"Получено событие выбора сертификата: {event}")
+                    # Автоматически выбираем первый сертификат (индекс 0)
+                    cdp_session.send('Security.handleCertificateError', {
+                        'eventId': event.get('eventId', 0),
+                        'action': 'continue'
+                    })
+                    logger.info("Сертификат выбран автоматически")
+                except Exception as e:
+                    logger.warning(f"Ошибка при автоматическом выборе сертификата: {e}")
+
+            # Подписываемся на события сертификатов
+            cdp_session.on('Security.certificateError', handle_certificate_selection)
+            logger.debug("Обработчик событий сертификатов установлен")
+
+            # Отключаем блокировку на ошибках сертификатов
+            cdp_session.send('Security.setOverrideCertificateErrors', {'override': True})
+            logger.debug("Переопределение ошибок сертификатов включено")
+
+        except Exception as e:
+            # Не критичная ошибка - продолжаем работу
+            logger.warning(f"Не удалось настроить автоматический выбор сертификатов через CDP: {e}")
+            logger.debug("Будет использован только флаг --auto-select-client-certificate")
+
     def setup_browser(self, ignore_https_errors: bool = False):
         """
         Настройка и запуск браузера
@@ -149,11 +192,21 @@ class WebParser:
             logger.debug("Инициализация Playwright")
             self.playwright = sync_playwright().start()
 
-            # Запускаем Chromium с поддержкой клиентских сертификатов
+            # Запускаем Chromium с поддержкой автоматического выбора клиентских сертификатов
+            # Получаем сертификаты для логирования
+            certs = self.get_windows_certificates()
+            if certs:
+                logger.info(f"Будет использован сертификат: {certs[0]}")
+
             browser_args = [
                 '--ignore-certificate-errors',
                 '--disable-web-security',
+                # Основные флаги для автоматического выбора сертификатов
                 '--auto-select-client-certificate',
+                '--enable-features=AutoSelectClientCertificateForUrls',
+                # Отключаем интерактивные диалоги
+                '--no-first-run',
+                '--no-default-browser-check',
             ]
             logger.debug(f"Аргументы браузера: {browser_args}")
 
@@ -177,6 +230,9 @@ class WebParser:
 
             self.page = self.context.new_page()
             logger.debug("Новая страница создана")
+
+            # Настраиваем автоматический выбор сертификата через CDP
+            self._setup_auto_certificate_selection()
 
             # Устанавливаем таймаут
             self.page.set_default_timeout(self.timeout)
